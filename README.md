@@ -1,6 +1,9 @@
 dotnet add package OpenCvSharp4
+
 dotnet add package OpenCvSharp4.runtime.win
+
 dotnet add package OpenCvSharp4.Extensions
+
 dotnet add package System.IO.Ports
 
 
