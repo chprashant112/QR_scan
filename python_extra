@@ -1,0 +1,56 @@
+pip install opencv-python pyserial pillow
+
+
+
+Trigger Arduino (Arduino 1):
+
+C++
+const int sensorPin = 2; 
+int lastSensorState = LOW;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(sensorPin, INPUT); 
+}
+
+void loop() {
+  int currentState = digitalRead(sensorPin);
+  if (currentState == HIGH && lastSensorState == LOW) {
+    Serial.println("1"); // Sends '1' to Python
+    delay(500); // Debounce
+  }
+  lastSensorState = currentState;
+  delay(10);
+}
+
+
+
+
+
+# Conveyor Arduino (Arduino 2):
+
+C++
+const int conveyorPin = 3; 
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(conveyorPin, OUTPUT);
+  digitalWrite(conveyorPin, LOW);
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    char command = Serial.read();
+    if (command == '1') {
+      digitalWrite(conveyorPin, HIGH); // Send 5V to move conveyor
+      delay(500); // Adjust this for how long you want 5v active
+      digitalWrite(conveyorPin, LOW);
+    }
+  }
+}
+
+
+
+
+
+pyinstaller --onefile --noconsole main_app.py
