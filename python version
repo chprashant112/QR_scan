@@ -1,0 +1,264 @@
+import cv2
+import serial
+import serial.tools.list_ports
+import os
+import time
+import threading
+import shutil
+import tkinter as tk
+from tkinter import ttk, messagebox
+from datetime import datetime
+from PIL import Image, ImageTk
+
+class ConveyorApp:
+    def __init__(self, root, window_title):
+        self.root = root
+        self.root.title(window_title)
+        self.root.geometry("1100x650")
+        
+        # --- State Variables ---
+        self.camera = cv2.VideoCapture(0) # Change to 1 or 2 if using external webcam
+        self.qr_decoder = cv2.QRCodeDetector()
+        self.roi = None
+        self.is_running = False
+        self.serial_trigger = None
+        self.serial_conveyor = None
+        
+        # --- UI Layout ---
+        self.main_frame = tk.Frame(self.root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Left Side: Video Feed
+        self.video_label = tk.Label(self.main_frame, bg="black")
+        self.video_label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Right Side: Control Panel
+        self.side_panel = tk.Frame(self.main_frame, width=300, padx=20)
+        self.side_panel.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.build_side_panel()
+        
+        # --- Start Loops ---
+        self.update_video_feed()
+        self.start_background_sync_thread()
+
+    def build_side_panel(self):
+        tk.Label(self.side_panel, text="Control Panel", font=("Arial", 16, "bold")).pack(pady=10)
+        
+        # COM Ports
+        ports = [port.device for port in serial.tools.list_ports.comports()]
+        
+        tk.Label(self.side_panel, text="Trigger Arduino Port (Sensor):").pack(anchor="w", pady=(10,0))
+        self.port1_var = tk.StringVar()
+        self.port1_cb = ttk.Combobox(self.side_panel, textvariable=self.port1_var, values=ports)
+        self.port1_cb.pack(fill=tk.X)
+        
+        tk.Label(self.side_panel, text="Conveyor Arduino Port:").pack(anchor="w", pady=(10,0))
+        self.port2_var = tk.StringVar()
+        self.port2_cb = ttk.Combobox(self.side_panel, textvariable=self.port2_var, values=ports)
+        self.port2_cb.pack(fill=tk.X)
+        
+        # Server / Sync Settings
+        tk.Label(self.side_panel, text="Server Path (e.g., Z:\\Backups):").pack(anchor="w", pady=(20,0))
+        self.server_path_var = tk.StringVar(value="C:\\ServerBackup")
+        tk.Entry(self.side_panel, textvariable=self.server_path_var).pack(fill=tk.X)
+        
+        tk.Label(self.side_panel, text="Sync Interval (Minutes):").pack(anchor="w", pady=(10,0))
+        self.sync_interval_var = tk.StringVar(value="5")
+        ttk.Combobox(self.side_panel, textvariable=self.sync_interval_var, values=["1", "5", "15", "30", "60"]).pack(fill=tk.X)
+        
+        # Buttons
+        self.btn_roi = tk.Button(self.side_panel, text="1. Set ROI (Draw Rectangle)", command=self.set_roi, bg="lightblue", font=("Arial", 10, "bold"))
+        self.btn_roi.pack(fill=tk.X, pady=(30, 10))
+        
+        self.btn_start = tk.Button(self.side_panel, text="2. Start System", command=self.toggle_system, bg="lightgreen", font=("Arial", 12, "bold"))
+        self.btn_start.pack(fill=tk.X, pady=10)
+        
+        self.status_log = tk.Text(self.side_panel, height=10, width=30, font=("Arial", 9))
+        self.status_log.pack(fill=tk.BOTH, expand=True, pady=10)
+        self.log_msg("System Initialized. Waiting for setup.")
+
+    def log_msg(self, msg):
+        """Helper to print messages to the GUI text box."""
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        self.status_log.insert(tk.END, f"[{timestamp}] {msg}\n")
+        self.status_log.see(tk.END)
+
+    def update_video_feed(self):
+        """Continuously pulls frames from the camera and displays them in the GUI."""
+        ret, frame = self.camera.read()
+        if ret:
+            # Draw ROI box if it exists
+            display_frame = frame.copy()
+            if self.roi:
+                x, y, w, h = self.roi
+                cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                cv2.putText(display_frame, "ROI Active", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            # Convert to Tkinter format
+            display_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(display_frame)
+            imgtk = ImageTk.PhotoImage(image=img)
+            self.video_label.imgtk = imgtk
+            self.video_label.configure(image=imgtk)
+            
+        self.root.after(30, self.update_video_feed) # Loop every 30ms
+
+    def set_roi(self):
+        """Opens an OpenCV window to draw the ROI."""
+        ret, frame = self.camera.read()
+        if not ret:
+            messagebox.showerror("Error", "Cannot read from camera.")
+            return
+            
+        messagebox.showinfo("Instructions", "A new window will open.\n1. Click and drag to draw ROI.\n2. Press 'SPACE' or 'ENTER' to confirm.")
+        
+        # selectROI opens a dedicated window for dragging a box
+        roi = cv2.selectROI("Select QR ROI", frame, fromCenter=False, showCrosshair=True)
+        cv2.destroyWindow("Select QR ROI")
+        
+        if roi[2] > 0 and roi[3] > 0: # Ensure width and height are > 0
+            self.roi = roi
+            self.log_msg(f"ROI Set: {self.roi}")
+        else:
+            self.log_msg("ROI selection cancelled.")
+
+    def toggle_system(self):
+        """Starts or Stops the hardware trigger loop."""
+        if not self.is_running:
+            # START
+            if not self.roi:
+                messagebox.showwarning("Warning", "Please set ROI before starting.")
+                return
+                
+            p1 = self.port1_var.get()
+            p2 = self.port2_var.get()
+            
+            if not p1 or not p2:
+                messagebox.showwarning("Warning", "Please select both COM ports.")
+                return
+                
+            try:
+                self.serial_trigger = serial.Serial(p1, 9600, timeout=0)
+                self.serial_conveyor = serial.Serial(p2, 9600, timeout=0)
+                time.sleep(2) # Allow Arduino reset
+                
+                self.is_running = True
+                self.btn_start.config(text="Stop System", bg="salmon")
+                self.btn_roi.config(state=tk.DISABLED)
+                self.log_msg("System Armed. Listening for triggers...")
+                self.hardware_loop() # Start listening
+            except Exception as e:
+                messagebox.showerror("Serial Error", f"Could not connect to ports:\n{e}")
+        else:
+            # STOP
+            self.is_running = False
+            self.btn_start.config(text="Start System", bg="lightgreen")
+            self.btn_roi.config(state=tk.NORMAL)
+            if self.serial_trigger: self.serial_trigger.close()
+            if self.serial_conveyor: self.serial_conveyor.close()
+            self.log_msg("System Stopped.")
+
+    def hardware_loop(self):
+        """Checks Arduino 1 for '1'. If received, process frame, save, trigger Arduino 2."""
+        if self.is_running:
+            try:
+                if self.serial_trigger.in_waiting > 0:
+                    data = self.serial_trigger.readline().decode('utf-8').strip()
+                    
+                    if data == "1":
+                        self.log_msg("Trigger received! Capturing...")
+                        
+                        # Flush buffer and read latest frame
+                        for _ in range(5): self.camera.grab()
+                        ret, frame = self.camera.read()
+                        
+                        if ret:
+                            self.process_and_save(frame)
+                        else:
+                            self.log_msg("Camera capture failed.")
+            except Exception as e:
+                self.log_msg(f"Hardware Loop Error: {e}")
+                self.toggle_system() # Stop on error
+                
+            # Loop again after 10ms to prevent UI freezing
+            self.root.after(10, self.hardware_loop)
+
+    def process_and_save(self, frame):
+        """Crops ROI, finds QR, saves FULL image, sends signal to Conveyor."""
+        x, y, w, h = self.roi
+        roi_crop = frame[y:y+h, x:x+w]
+        
+        retval, decoded_info, points, _ = self.qr_decoder.detectAndDecode(roi_crop)
+        
+        if retval and decoded_info:
+            # 1. Create Date Folder (Local)
+            date_folder_name = datetime.now().strftime('%Y-%m-%d')
+            local_save_dir = os.path.join(os.getcwd(), "Local_Data", date_folder_name)
+            os.makedirs(local_save_dir, exist_ok=True)
+            
+            # 2. Save Image
+            safe_filename = "".join([c for c in decoded_info if c.isalnum() or c in (' ', '-', '_')]).rstrip()
+            filepath = os.path.join(local_save_dir, f"{safe_filename}.jpg")
+            
+            cv2.imwrite(filepath, frame) # Saving the FULL frame
+            self.log_msg(f"Saved: {safe_filename}.jpg")
+            
+            # 3. Send '1' to Conveyor Arduino
+            self.serial_conveyor.write(b"1\n")
+            self.log_msg("Conveyor triggered.")
+        else:
+            self.log_msg("Failed to detect QR in ROI.")
+
+    def start_background_sync_thread(self):
+        """Runs the sync function in a background thread."""
+        thread = threading.Thread(target=self.sync_worker, daemon=True)
+        thread.start()
+
+    def sync_worker(self):
+        """Background process that copies data from Local to Server every X minutes."""
+        while True:
+            try:
+                interval_minutes = int(self.sync_interval_var.get())
+                time.sleep(interval_minutes * 60) # Convert to seconds
+                
+                server_base_path = self.server_path_var.get()
+                local_base_path = os.path.join(os.getcwd(), "Local_Data")
+                
+                if not os.path.exists(local_base_path):
+                    continue # Nothing to sync yet
+                    
+                if not os.path.exists(server_base_path):
+                    os.makedirs(server_base_path, exist_ok=True)
+                    
+                # Copy today's date folder to the server
+                date_folder_name = datetime.now().strftime('%Y-%m-%d')
+                local_today_path = os.path.join(local_base_path, date_folder_name)
+                server_today_path = os.path.join(server_base_path, date_folder_name)
+                
+                if os.path.exists(local_today_path):
+                    # Uses shutil.copytree to merge local files into server directory
+                    os.makedirs(server_today_path, exist_ok=True)
+                    for filename in os.listdir(local_today_path):
+                        src_file = os.path.join(local_today_path, filename)
+                        dst_file = os.path.join(server_today_path, filename)
+                        if not os.path.exists(dst_file): # Only copy new files
+                            shutil.copy2(src_file, dst_file)
+                            
+                    self.log_msg("Background Sync Complete.")
+                    
+            except Exception as e:
+                print(f"Sync error: {e}")
+
+    def on_closing(self):
+        if self.is_running:
+            self.toggle_system()
+        if self.camera.isOpened():
+            self.camera.release()
+        self.root.destroy()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ConveyorApp(root, "Industrial QR Conveyor Control")
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    root.mainloop()
